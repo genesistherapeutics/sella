@@ -5,7 +5,7 @@ import numpy as np
 
 from sella.hessian_update import update_H
 from sella import _gpu as _gpu_mod
-from sella._gpu import gpu_eigh, gpu_eigh_t, to_gpu
+from sella._gpu import hessian_eigh, gpu_eigh_t, to_gpu
 
 from scipy.sparse.linalg import LinearOperator
 
@@ -210,7 +210,7 @@ class ApproximateHessian(LinearOperator):
                 self._eigen_computed = True
                 return
         # CPU fallback (no GPU or OOM)
-        self._evals, self._evecs = gpu_eigh(self.asarray(), A_gpu=None)
+        self._evals, self._evecs = hessian_eigh(self.asarray(), A_gpu=None)
         self._eigen_computed = True
 
     def _get_B_gpu(self):
@@ -223,7 +223,7 @@ class ApproximateHessian(LinearOperator):
             return self._B_gpu
         if self.B is None:
             return None
-        if _gpu_mod._gpu_ok(self.B.shape[0]):
+        if _gpu_mod._gpu_ok(self.B.shape[0], _gpu_mod._GPU_EIGH_MIN_DIM):
             self._B_gpu = to_gpu(self.asarray())
         return self._B_gpu
 

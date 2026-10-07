@@ -20,6 +20,8 @@ from ase.constraints import (
 import jax.numpy as jnp
 from jax import jit, grad, jacfwd, jacrev, vmap, jvp, device_get
 
+from sella import _numba
+
 from sella.linalg import (
     SparseInternalJacobian, SparseInternalHessian, SparseInternalHessians,
     SparseInternalHessiansSkeleton
@@ -535,6 +537,10 @@ class Internal(Coordinate):
         raise NotImplementedError
 
     def calc(self, atoms: Atoms) -> float:
+        if _numba.ENABLED and type(self) in (Bond, Angle, Dihedral):
+            positions = atoms.positions[self.indices][None, :, :]
+            translations = np.asarray(self.kwargs['ncvecs'] @ atoms.cell)[None, :, :]
+            return float(_numba.values(positions, translations)[0])
         tvecs = jnp.asarray(
             self.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
         )
@@ -2105,6 +2111,8 @@ class BaseInternals:
         """Compute values for one batched family, then slice off padding."""
         if family.n_actual == 0:
             return np.empty(0)
+        if _numba.ENABLED and not np.any(self.atoms.pbc):
+            return _numba.values(positions[family.indices], tvecs[spec.key])
         pos = positions[family.indices_padded]
         values = spec.value_fn(pos, tvecs[f"{spec.key}_padded"])
         return np.asarray(device_get(values))[:family.n_actual]
@@ -2115,6 +2123,11 @@ class BaseInternals:
         """Compute gradient/Hessian tensors for one family with padded batches."""
         if family.n_actual == 0:
             return family.indices, np.empty((0,) + empty_tail)
+        if _numba.ENABLED and not np.any(self.atoms.pbc) and fn is spec.grad_fn:
+            local = positions[family.indices]
+            translations = tvecs[spec.key]
+            if _numba.regular(local, translations):
+                return family.indices, _numba.gradients(local, translations)
         pos = positions[family.indices_padded]
         padded = fn(pos, tvecs[f"{spec.key}_padded"])
         return family.indices, np.asarray(device_get(padded))[:family.n_actual]
@@ -2782,6 +2795,12 @@ class BaseInternals:
         if family.n_actual == 0 or not active.any():
             return None
 
+        if _numba.ENABLED and not np.any(self.atoms.pbc):
+            indices = family.indices[active]
+            pos = positions[indices]
+            translations = tvecs[spec.key][active]
+            if _numba.regular(pos, translations):
+                return _numba.specialized_hvps(pos, translations, v_atoms[indices])
         if active.all():
             indices = family.indices_padded
             pos = positions[indices]
@@ -2800,6 +2819,8 @@ class BaseInternals:
         n_active = int(active.sum())
         if n_active == 0:
             return row
+        if _numba.ENABLED:
+            return _numba.scatter_jacobian(B, row, indices, grads, active)
         rows_idx = np.arange(row, row + n_active)[:, None]
         B[rows_idx, indices[active]] = grads[active]
         return row + n_active
@@ -2907,12 +2928,19 @@ class BaseInternals:
 
         batched_active = (bonds_active, angles_active, dihedrals_active)
         families = self._batched_family_arrays
-        batched_hvp = {
-            spec.key: self._launch_batched_hvp_family(
-                spec, families[spec.key], positions, tvecs, v_atoms, active
-            )
-            for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active)
-        }
+        batched_hvp = {}
+        contracted = {}
+        for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active):
+            family = families[spec.key]
+            indices = family.indices[active]
+            translations = tvecs[spec.key][active]
+            if (_numba.ENABLED and not np.any(self.atoms.pbc)
+                    and _numba.regular(positions[indices], translations)):
+                contracted[spec.key] = _numba.specialized_contracted_family(
+                    positions, indices, translations, v_atoms, mat_atoms)
+            else:
+                batched_hvp[spec.key] = self._launch_batched_hvp_family(
+                    spec, family, positions, tvecs, v_atoms, active)
 
         rot_closed_results = []
         rot_batched_slots = None
@@ -2956,6 +2984,11 @@ class BaseInternals:
 
         for spec, active in zip(_BATCHED_COORD_FAMILIES, batched_active):
             family = families[spec.key]
+            if spec.key in contracted:
+                result = contracted[spec.key]
+                out[row:row + len(result)] = result
+                row += len(result)
+                continue
             row = self._contract_batched_hvp_family(
                 batched_hvp[spec.key], active,
                 family.n_actual,
@@ -4891,19 +4924,28 @@ class Internals(BaseInternals):
         return spread > 0 and gap / spread < threshold
 
     def _bad_angles(self):
-        """Return angle coordinates near 0 or pi using the padded JAX batch."""
+        """Return angle coordinates near 0 or pi with unchanged boundary decisions."""
         self._build_batched_arrays()
         angles = self._batched_family_arrays['angles']
         if angles.n_actual == 0:
             return []
         tvecs = self._get_cached_tvecs(self.atoms.cell.array)
-        angle_pos = self.all_positions[angles.indices_padded]
-        angle_vals_padded = np.asarray(
-            _angle_value_batched(angle_pos, tvecs['angles_padded'])
-        )
-        angle_vals = angle_vals_padded[:angles.n_actual]
-        bad_mask = ~((self.atol < angle_vals)
-                     & (angle_vals < np.pi - self.atol))
+        if _numba.ENABLED and not np.any(self.atoms.pbc):
+            bad_mask, ambiguous = _numba.bad_angle_mask(
+                self.all_positions[angles.indices], tvecs['angles'], self.atol)
+            # Preserve JAX's decision when rounding could cross a strict
+            # boundary. test_bad_angle_checks_match_reference covers both ends,
+            # singular angles, and periodic fallback.
+        else:
+            ambiguous = True
+        if ambiguous:
+            angle_pos = self.all_positions[angles.indices_padded]
+            angle_vals_padded = np.asarray(
+                _angle_value_batched(angle_pos, tvecs['angles_padded'])
+            )
+            angle_vals = angle_vals_padded[:angles.n_actual]
+            bad_mask = ~((self.atol < angle_vals)
+                         & (angle_vals < np.pi - self.atol))
         return [self.internals['angles'][idx] for idx in np.where(bad_mask)[0]]
 
     def _bad_rotation_from_cached_eigh(self, rotations, cached_eigh):
@@ -5031,6 +5073,21 @@ class Internals(BaseInternals):
         return h0 * units.Hartree
 
     def guess_hessian(self, h0cart=70.) -> np.ndarray:
+        if _numba.ENABLED and not np.any(self.atoms.pbc):
+            self._build_batched_arrays()
+            families = self._batched_family_arrays
+            molecular = _numba.guess_hessian_diagonal(
+                self.all_positions, self.all_atoms.numbers,
+                families['bonds'].indices, families['angles'].indices,
+                families['dihedrals'].indices, covalent_radii,
+                units.Bohr, units.Hartree, self.natoms)
+            rigid = 0.05 * units.Hartree if self.allow_fragments else h0cart
+            diagonal = np.concatenate((
+                np.full(len(self.internals['translations']), rigid),
+                molecular,
+                np.full(len(self.internals['other']), h0cart),
+                np.full(len(self.internals['rotations']), rigid)))
+            return np.diag(np.abs(diagonal[np.asarray(self._active_mask, dtype=bool)]))
         # Bond count per atom (molecular topology) feeds the dihedral
         # curvature heuristic; count over all bonds, independent of which
         # coordinates are currently active.

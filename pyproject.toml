@@ -3,7 +3,7 @@ name = "sella"
 dynamic = ["version"] # Let setuptools-scm manage version
 description = "Saddle point optimization for molecular systems"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "LGPL-3.0" }
 authors = [
   { name = "Eric Hermes", email = "erichermes@gmail.com" },
@@ -17,7 +17,6 @@ classifiers = [
   "Natural Language :: English",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
@@ -32,6 +31,7 @@ dependencies = [
   "ase >= 3.26.0",
   "jax >= 0.4.20",
   "jaxlib >= 0.4.20",
+  "numba >= 0.61",
 ]
 
 [project.urls]

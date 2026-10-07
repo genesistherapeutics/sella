@@ -9,15 +9,17 @@ oversubscribes the CPU N-fold, which thrashes and slows every process.
 ``configure_compute(max_cpu_threads=...)`` lets whatever launches the Sella
 processes hand each one a slice of the cores (typically ``cpu_count // N``).
 
-Only CPU threads are handled here. PyTorch/CUDA expose no runtime per-process
-cap on GPU *compute* threads, so partitioning a shared GPU is left to the
-driver / CUDA MPS / the launcher.
+The same setup API selects GPU algebra, Hessian eigensolve precision and a
+shared eigensolve concurrency budget. It does not partition GPU compute
+resources used by an energy/force calculator.
 """
 
 import ctypes
 import logging
 import os
 import re
+
+from ._gpu import configure_linalg
 
 logger = logging.getLogger(__name__)
 
@@ -116,16 +118,18 @@ def set_cpu_threads(n):
         pass
 
 
-def configure_compute(max_cpu_threads=None):
+def configure_compute(max_cpu_threads=None, *, use_gpu=None,
+                      hessian_eigh_dtype=None,
+                      hessian_eigh_max_concurrent=None,
+                      hessian_eigh_min_dim=None):
     """Configure this process's compute-resource share for Sella.
 
     Meant to be called once by whatever spins up the Sella processes so each
     one uses only its allotted slice of the cores. Safe before or after building
     a ``Sella`` object; earlier is better (it caps the pools before they work).
 
-    Only CPU threads are handled: PyTorch/CUDA expose no runtime per-process cap
-    on GPU compute threads, so partitioning a shared GPU is left to the driver /
-    CUDA MPS / the launcher.
+    Call before launching concurrent optimizer workers. These settings are
+    process-wide and must not be changed while optimizations are running.
 
     Parameters
     ----------
@@ -134,5 +138,24 @@ def configure_compute(max_cpu_threads=None):
         CPU-BLAS bound, so when co-locating ``N`` processes on one machine set
         this to roughly ``cpu_count // N`` to avoid oversubscription. ``None``
         (default) leaves library defaults untouched.
+    use_gpu : bool, optional
+        Enable or disable Sella GPU linear algebra. None keeps its current state.
+        This does not change the device of the energy/force calculator.
+    hessian_eigh_dtype : str, optional
+        None preserves current settings (initially float64). Float32 requires
+        use_gpu=False; only approximate
+        Hessian eigensolves use it. Eigenpairs and optimizer state stay float64,
+        with float64 fallback for failed or nonfinite float32 eigenpairs.
+    hessian_eigh_max_concurrent : int, optional
+        Shared limit on simultaneous dense Hessian eigensolves. None leaves
+        concurrency uncapped. Smaller matrices bypass the limit.
+    hessian_eigh_min_dim : int, optional
+        Minimum matrix dimension subject to the shared cap (default 200).
     """
+    if any(value is not None for value in (
+            use_gpu, hessian_eigh_dtype, hessian_eigh_max_concurrent,
+            hessian_eigh_min_dim)):
+        configure_linalg(use_gpu, hessian_eigh_dtype or 'float64',
+                         hessian_eigh_max_concurrent,
+                         200 if hessian_eigh_min_dim is None else hessian_eigh_min_dim)
     set_cpu_threads(max_cpu_threads)
