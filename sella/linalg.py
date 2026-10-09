@@ -5,7 +5,7 @@ import numpy as np
 
 from sella.hessian_update import update_H
 from sella import _gpu as _gpu_mod
-from sella._gpu import hessian_eigh, gpu_eigh_t, to_gpu
+from sella._gpu import hessian_eigh_budget, gpu_eigh_t, to_gpu
 
 from scipy.sparse.linalg import LinearOperator
 
@@ -199,19 +199,22 @@ class ApproximateHessian(LinearOperator):
             return
         if self.B is None and self._B_gpu is None:
             return
-        B_gpu = self._get_B_gpu()
-        if B_gpu is not None:
-            evals_t, evecs_t = gpu_eigh_t(B_gpu)
-            if evals_t is not None:
-                self._evals_gpu = evals_t
-                self._evecs_gpu = evecs_t
-                self._evals = evals_t.cpu().numpy()
-                self._evecs = evecs_t.cpu().numpy()
-                self._eigen_computed = True
-                return
-        # CPU fallback (no GPU or OOM)
-        self._evals, self._evecs = hessian_eigh(self.asarray(), A_gpu=None)
-        self._eigen_computed = True
+        with hessian_eigh_budget(self.dim):
+            B_gpu = self._get_B_gpu()
+            if B_gpu is not None:
+                evals_t, evecs_t = gpu_eigh_t(B_gpu)
+                if evals_t is not None:
+                    self._evals_gpu = evals_t
+                    self._evecs_gpu = evecs_t
+                    self._evals = evals_t.cpu().numpy()
+                    self._evecs = evecs_t.cpu().numpy()
+                    self._eigen_computed = True
+                    return
+            # The GPU attempt and CPU fallback share one acquisition.
+            self._evals, self._evecs = _gpu_mod._hessian_eigh_unlimited(
+                self.asarray(), A_gpu=None
+            )
+            self._eigen_computed = True
 
     def _get_B_gpu(self):
         """Return cached torch tensor of B on GPU, uploading lazily.
@@ -716,7 +719,6 @@ class SparseInternalHessians:
             result = np.einsum('naibj,nbj->nai', vals, vi_sub)
 
             # Vectorized scatter
-            batch = len(orig_idx)
             row_idx = np.repeat(orig_idx, size)
             col_idx = idx.ravel()
             result_flat = result.reshape(-1, 3)

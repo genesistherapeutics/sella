@@ -13,6 +13,7 @@ attempt for that size; this keeps smaller GPUs from thrashing.
 """
 
 import os
+from contextlib import nullcontext
 from threading import BoundedSemaphore
 import numpy as np
 from scipy.linalg import eigh as _cpu_eigh
@@ -61,46 +62,63 @@ _oom_floor = None
 _hessian_eigh_dtype = np.dtype('float64')
 _hessian_eigh_slots = None
 _hessian_eigh_min_dim = 200
+_UNSET = object()
 
 
-def configure_linalg(use_gpu=None, hessian_eigh_dtype='float64',
-                     hessian_eigh_max_concurrent=None, hessian_eigh_min_dim=200):
-    """Select Hessian precision and a shared budget before starting optimizers."""
-    dtype = np.dtype(hessian_eigh_dtype)
+def configure_linalg(use_gpu=None, hessian_eigh_dtype=None,
+                     hessian_eigh_max_concurrent=_UNSET, hessian_eigh_min_dim=None):
+    """Update specified solver settings before starting optimizers."""
+    global _has_torch, _hessian_eigh_dtype, _hessian_eigh_slots, _hessian_eigh_min_dim
+    dtype = (_hessian_eigh_dtype if hessian_eigh_dtype is None
+             else np.dtype(hessian_eigh_dtype))
+    min_dim = (_hessian_eigh_min_dim if hessian_eigh_min_dim is None
+               else hessian_eigh_min_dim)
     if dtype not in (np.dtype('float32'), np.dtype('float64')):
         raise ValueError('Hessian eigensolves require float32 or float64')
-    if hessian_eigh_max_concurrent is not None and hessian_eigh_max_concurrent < 1:
+    if (hessian_eigh_max_concurrent is not _UNSET
+            and hessian_eigh_max_concurrent is not None
+            and hessian_eigh_max_concurrent < 1):
         raise ValueError('Hessian eigensolve concurrency must be positive')
-    if hessian_eigh_min_dim < 0:
+    if min_dim < 0:
         raise ValueError('Hessian eigensolve minimum dimension must be nonnegative')
-    if dtype == np.dtype('float32') and use_gpu is not False:
+    gpu_enabled = _has_torch if use_gpu is None else bool(use_gpu)
+    if dtype == np.dtype('float32') and gpu_enabled:
         raise ValueError('Float32 Hessian eigensolves require use_gpu=False')
-    global _has_torch, _hessian_eigh_dtype, _hessian_eigh_slots, _hessian_eigh_min_dim
+    slots = _hessian_eigh_slots
+    if hessian_eigh_max_concurrent is not _UNSET:
+        slots = (BoundedSemaphore(hessian_eigh_max_concurrent)
+                 if hessian_eigh_max_concurrent is not None else None)
     if use_gpu is not None:
         _has_torch = bool(use_gpu and torch is not None and torch.cuda.is_available())
     _hessian_eigh_dtype = dtype
-    _hessian_eigh_min_dim = hessian_eigh_min_dim
-    _hessian_eigh_slots = (BoundedSemaphore(hessian_eigh_max_concurrent)
-                           if hessian_eigh_max_concurrent is not None else None)
+    _hessian_eigh_min_dim = min_dim
+    _hessian_eigh_slots = slots
+
+
+def hessian_eigh_budget(dimension):
+    """Hold one slot through a Hessian solve, synchronization and any fallback."""
+    if _hessian_eigh_slots is None or dimension < _hessian_eigh_min_dim:
+        return nullcontext()
+    return _hessian_eigh_slots
+
+
+def _hessian_eigh_unlimited(matrix, A_gpu=None):
+    """Solve under a budget already held by the caller; do not acquire twice."""
+    if _hessian_eigh_dtype == np.dtype('float32') and _numba.ENABLED and matrix.size:
+        try:
+            values, vectors = _numba.eigh(np.ascontiguousarray(matrix, dtype=np.float32))
+            if not np.isfinite(values).all() or not np.isfinite(vectors).all():
+                raise np.linalg.LinAlgError('Nonfinite float32 eigenpairs')
+            return values.astype(np.float64), vectors.astype(np.float64)
+        except np.linalg.LinAlgError:
+            pass
+    return gpu_eigh(matrix, A_gpu=A_gpu)
 
 
 def hessian_eigh(matrix, A_gpu=None):
     """Solve a Hessian with float64 outputs, retrying failed FP32 solves in FP64."""
-    def solve():
-        if _hessian_eigh_dtype == np.dtype('float32') and _numba.ENABLED and matrix.size:
-            try:
-                values, vectors = _numba.eigh(np.ascontiguousarray(matrix, dtype=np.float32))
-                if not np.isfinite(values).all() or not np.isfinite(vectors).all():
-                    raise np.linalg.LinAlgError('Nonfinite float32 eigenpairs')
-                return values.astype(np.float64), vectors.astype(np.float64)
-            except np.linalg.LinAlgError:
-                pass
-        return gpu_eigh(matrix, A_gpu=A_gpu)
-
-    if _hessian_eigh_slots is None or matrix.shape[0] < _hessian_eigh_min_dim:
-        return solve()
-    with _hessian_eigh_slots:
-        return solve()
+    with hessian_eigh_budget(matrix.shape[0]):
+        return _hessian_eigh_unlimited(matrix, A_gpu=A_gpu)
 
 
 def _gpu_ok(n, min_dim=None):

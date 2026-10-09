@@ -91,7 +91,11 @@ or nonfinite float32 eigenpairs retry in float64. Float32 can change optimizatio
 trajectories and the local minimum reached; choose it for workloads where that
 tradeoff is acceptable. Disabling Sella's GPU algebra leaves the calculator's
 GPU device unchanged. Matrices smaller than the configured minimum bypass the
-shared concurrency limit.
+shared concurrency limit on both CPU and GPU; a failed GPU solve retains its
+slot through the CPU fallback. Later configuration calls preserve omitted
+settings. For example, `configure_compute(hessian_eigh_min_dim=250)` changes
+only the threshold, and `configure_compute(hessian_eigh_max_concurrent=None)`
+explicitly removes the cap.
 
 When GPU algebra is enabled, the CPU/GPU defaults are 500 rows for eigh and 700
 for QR. `SELLA_GPU_EIGH_MIN_DIM` and `SELLA_GPU_QR_MIN_DIM` override these;

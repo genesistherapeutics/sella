@@ -19,7 +19,7 @@ import logging
 import os
 import re
 
-from ._gpu import configure_linalg
+from ._gpu import _UNSET, configure_linalg
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ def set_cpu_threads(n):
 
 def configure_compute(max_cpu_threads=None, *, use_gpu=None,
                       hessian_eigh_dtype=None,
-                      hessian_eigh_max_concurrent=None,
+                      hessian_eigh_max_concurrent=_UNSET,
                       hessian_eigh_min_dim=None):
     """Configure this process's compute-resource share for Sella.
 
@@ -147,15 +147,16 @@ def configure_compute(max_cpu_threads=None, *, use_gpu=None,
         Hessian eigensolves use it. Eigenpairs and optimizer state stay float64,
         with float64 fallback for failed or nonfinite float32 eigenpairs.
     hessian_eigh_max_concurrent : int, optional
-        Shared limit on simultaneous dense Hessian eigensolves. None leaves
-        concurrency uncapped. Smaller matrices bypass the limit.
+        Shared limit on simultaneous dense Hessian eigensolves. Omitting this
+        preserves the current limit (initially uncapped); explicit None removes
+        it. Smaller matrices bypass the limit on both CPU and GPU.
     hessian_eigh_min_dim : int, optional
-        Minimum matrix dimension subject to the shared cap (default 200).
+        Minimum matrix dimension subject to the shared cap. None preserves the
+        current threshold (initially 200).
     """
     if any(value is not None for value in (
-            use_gpu, hessian_eigh_dtype, hessian_eigh_max_concurrent,
-            hessian_eigh_min_dim)):
-        configure_linalg(use_gpu, hessian_eigh_dtype or 'float64',
-                         hessian_eigh_max_concurrent,
-                         200 if hessian_eigh_min_dim is None else hessian_eigh_min_dim)
+            use_gpu, hessian_eigh_dtype, hessian_eigh_min_dim)
+    ) or hessian_eigh_max_concurrent is not _UNSET:
+        configure_linalg(use_gpu, hessian_eigh_dtype,
+                         hessian_eigh_max_concurrent, hessian_eigh_min_dim)
     set_cpu_threads(max_cpu_threads)
