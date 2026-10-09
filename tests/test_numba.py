@@ -6,7 +6,7 @@ from ase import Atoms
 from ase.build import molecule
 
 from sella import Internals, _numba
-from sella.internal import _BATCHED_COORD_FAMILIES
+from sella.internal import Angle, _BATCHED_COORD_FAMILIES
 
 
 @pytest.mark.parametrize("name", ["H2O", "CH4", "C2H6", "C6H6", "CO2"])
@@ -93,6 +93,131 @@ def test_exact_coordinate_derivatives(width: int) -> None:
 def test_collinear_derivatives_fall_back() -> None:
     positions = np.array([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]])
     assert not _numba.regular(positions, np.zeros((1, 2, 3)))
+
+
+def test_contracted_hvp_compiles_on_supported_numba(monkeypatch) -> None:
+    monkeypatch.setattr(_numba, "ENABLED", True)
+    internals = Internals(molecule("H2O"))
+    internals.find_all_bonds()
+    internals.find_all_angles()
+    internals.find_all_dihedrals()
+    tangent = np.arange(internals.ndof, dtype=float)
+    matrix = np.arange(internals.ndof * 2, dtype=float).reshape(-1, 2)
+    expected = internals.hessian_rdot(tangent) @ matrix
+    actual = internals.hessian_rdot_mat(tangent, matrix)
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
+    assert _numba.specialized_contracted_family.nopython_signatures
+
+
+@pytest.mark.parametrize("width", [2, 3, 4])
+@pytest.mark.parametrize("empty", [False, True])
+def test_contracted_hvp_gather_matches_reference(width, empty) -> None:
+    rng = np.random.default_rng(81)
+    positions = rng.normal(size=(7, 3))
+    # The two coordinates share atoms; the final matrix has a strided layout.
+    indices = np.array([np.arange(width), np.arange(1, width + 1)], dtype=np.int32)
+    if empty:
+        indices = indices[:0]
+    translations = rng.normal(size=(len(indices), width - 1, 3))
+    tangent = rng.normal(size=(7, 6))[:, ::2]
+    matrix = rng.normal(size=(7, 3, 6))[:, :, ::2]
+    family = _BATCHED_COORD_FAMILIES[width - 2]
+    local_hvp = family.hvp_fn(positions[indices], translations, tangent[indices])
+    expected = np.einsum("ijk,ijkc->ic", local_hvp, matrix[indices])
+    actual = _numba.specialized_contracted_family(
+        positions, indices, translations, tangent, matrix
+    )
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
+
+
+def test_warmup_compiles_on_supported_numba(monkeypatch) -> None:
+    monkeypatch.setattr(_numba, "ENABLED", True)
+    _numba.warmup()
+
+
+@pytest.mark.parametrize("moved", ["real", "dummy"])
+def test_hessian_guess_refreshes_dummy_position_cache(moved, monkeypatch) -> None:
+    monkeypatch.setattr(_numba, "ENABLED", True)
+    internals = Internals(molecule("CO2"))
+    internals.find_all_bonds()
+    internals.find_all_angles()
+    internals.find_all_dihedrals()
+    assert internals.ndummies == 1
+    original = internals.guess_hessian()
+    if moved == "real":
+        internals.atoms.positions[1, 2] += 0.1
+    else:
+        internals.dummies.positions[0, 2] += 0.1
+    actual = internals.guess_hessian()
+    monkeypatch.setattr(_numba, "ENABLED", False)
+    expected = internals.guess_hessian()
+    assert not np.allclose(original, expected)
+    np.testing.assert_allclose(actual, expected, rtol=1e-10, atol=1e-10)
+
+
+@pytest.mark.parametrize(
+    "positions",
+    [
+        [
+            [-0.0005409026870546452, 0.9996479184944448, 0.026528220332456297],
+            [0.0, 0.0, 0.0],
+            [-0.25253284869713705, 0.9670139783034056, -0.033333558086855786],
+        ],
+        [
+            [-0.7790332960177346, 0.007900674480262227, -0.6269327739387228],
+            [0.0, 0.0, 0.0],
+            [0.7945056431773062, -0.25694631551668373, 0.5502175696048027],
+        ],
+    ],
+    ids=["lower-cutoff", "upper-cutoff"],
+)
+def test_new_angle_topology_passes_its_own_singularity_check(positions, monkeypatch):
+    signatures = []
+    for enabled in (False, True):
+        monkeypatch.setattr(_numba, "ENABLED", enabled)
+        internals = Internals(Atoms("H3", positions=positions))
+        internals.add_bond((0, 1))
+        internals.add_bond((1, 2))
+        internals.find_all_angles()
+        assert internals.check_for_bad_internals() is None
+        signatures.append(
+            tuple(
+                (
+                    name,
+                    tuple(
+                        internals._internal_key(coord)
+                        for coord in internals.internals[name]
+                    ),
+                )
+                for name in internals._names
+            )
+        )
+    assert signatures[0] == signatures[1]
+
+
+@pytest.mark.parametrize("tolerance", [15.0, 30.0])
+@pytest.mark.parametrize("upper", [False, True])
+def test_dummy_angle_insertion_replays_ambiguous_cutoffs(tolerance, upper, monkeypatch):
+    degrees = 180.0 - tolerance if upper else tolerance
+    positions = [
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [np.cos(np.deg2rad(degrees)), np.sin(np.deg2rad(degrees)), 0.0],
+    ]
+    atoms = Atoms("H2X", positions=positions)
+    internals = Internals(atoms[:2], atol=tolerance)
+    angle = Angle((0, 1, 2))
+    # Force the fast value across the strict boundary; the dummy insertion
+    # predicate must still use the JAX value, as does ordinary construction.
+    translations = np.zeros((2, 3))
+    reference = float(angle._eval0(atoms.positions, translations))
+    boundary = np.pi - internals.atol if upper else internals.atol
+    shifted = np.nextafter(boundary, -np.inf if upper else np.inf)
+    monkeypatch.setattr(_numba, "ENABLED", True)
+    monkeypatch.setattr(angle.__class__, "calc", lambda self, atoms: shifted)
+    assert internals._angle_in_range(angle, atoms) == (
+        internals.atol < reference < np.pi - internals.atol
+    )
 
 
 def test_zero_length_angle_preserves_nan() -> None:

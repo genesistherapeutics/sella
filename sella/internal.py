@@ -4537,6 +4537,23 @@ class Internals(BaseInternals):
         if cumshifts:
             self._remap_ncvecs_after_fragment_shifts(cumshifts)
 
+    def _angle_in_range(self, angle: Angle, atoms: Atoms) -> bool:
+        """Use reference rounding for topology decisions at strict cutoffs."""
+        value = angle.calc(atoms)
+        upper = np.pi - self.atol
+        if _numba.ENABLED and (
+            abs(value - self.atol) < _numba.ANGLE_BOUNDARY_EPS
+            or abs(value - upper) < _numba.ANGLE_BOUNDARY_EPS
+        ):
+            # Match _bad_angles' replay window, including dummy insertion.
+            # test_new_angle_topology_passes_its_own_singularity_check covers
+            # the rotated boundary that previously built an invalid angle.
+            translations = jnp.asarray(
+                angle.kwargs['ncvecs'] @ atoms.cell, dtype=np.float64
+            )
+            value = float(angle._eval0(atoms.positions[angle.indices], translations))
+        return self.atol < value < upper
+
     def find_all_angles(
         self,
     ) -> None:
@@ -4557,7 +4574,7 @@ class Internals(BaseInternals):
                 )
                 # Angles inside the linear window are kept as ordinary bends;
                 # near-linear ones get dummy/dihedral treatment.
-                if self.atol < new.calc(self.atoms) < np.pi - self.atol:
+                if self._angle_in_range(new, self.atoms):
                     self._ignore_duplicate(self.add_angle, new)
                 else:
                     self.forbid_angle(new)
@@ -4613,8 +4630,7 @@ class Internals(BaseInternals):
         for bond in jbonds:
             new = bond + dbond
             assert new.indices[1] == j
-            angle = new.calc(self.all_atoms)
-            if self.atol < angle < np.pi - self.atol:
+            if self._angle_in_range(new, self.all_atoms):
                 self._ignore_duplicate(self.add_angle, new)
             else:
                 self.forbid_angle(new)
@@ -4946,6 +4962,19 @@ class Internals(BaseInternals):
             angle_vals = angle_vals_padded[:angles.n_actual]
             bad_mask = ~((self.atol < angle_vals)
                          & (angle_vals < np.pi - self.atol))
+            # Older JAX versions can round scalar and batched values
+            # differently. Use the construction predicate at strict cutoffs.
+            boundary_indices = np.flatnonzero(
+                (np.abs(angle_vals - self.atol) < _numba.ANGLE_BOUNDARY_EPS)
+                | (np.abs(angle_vals - (np.pi - self.atol))
+                   < _numba.ANGLE_BOUNDARY_EPS)
+            )
+            if len(boundary_indices):
+                atoms = self.all_atoms
+                for idx in boundary_indices:
+                    bad_mask[idx] = not self._angle_in_range(
+                        self.internals['angles'][idx], atoms
+                    )
         return [self.internals['angles'][idx] for idx in np.where(bad_mask)[0]]
 
     def _bad_rotation_from_cached_eigh(self, rotations, cached_eigh):
@@ -5073,6 +5102,7 @@ class Internals(BaseInternals):
         return h0 * units.Hartree
 
     def guess_hessian(self, h0cart=70.) -> np.ndarray:
+        self._cache_check()
         if _numba.ENABLED and not np.any(self.atoms.pbc):
             self._build_batched_arrays()
             families = self._batched_family_arrays

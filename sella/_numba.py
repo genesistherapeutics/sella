@@ -7,6 +7,9 @@ from . import _generated_hvp as generated_hvp
 from . import _generated_gradients
 
 
+ANGLE_BOUNDARY_EPS = 1e-12
+
+
 @njit(nogil=True, cache=True, error_model="numpy")
 def values(positions: np.ndarray, translations: np.ndarray) -> np.ndarray:
     out = np.empty(len(positions))
@@ -53,7 +56,10 @@ def bad_angle_mask(
     for i in range(len(angles)):
         angle = angles[i]
         mask[i] = not (tolerance < angle and angle < upper)
-        if abs(angle - tolerance) < 1e-12 or abs(angle - upper) < 1e-12:
+        if (
+            abs(angle - tolerance) < ANGLE_BOUNDARY_EPS
+            or abs(angle - upper) < ANGLE_BOUNDARY_EPS
+        ):
             ambiguous = True
     return mask, ambiguous
 
@@ -147,7 +153,18 @@ def specialized_contracted_family(
     tangent: np.ndarray,
     matrix: np.ndarray,
 ) -> np.ndarray:
-    local_hvp = specialized_hvps(positions[indices], translations, tangent[indices])
+    # Numba 0.61 cannot gather with a two-dimensional integer index array.
+    # Scalar indexing preserves the same inputs on the supported version floor.
+    local_positions = np.empty(
+        (len(indices), indices.shape[1], 3), dtype=positions.dtype
+    )
+    local_tangent = np.empty((len(indices), indices.shape[1], 3), dtype=tangent.dtype)
+    for i in range(len(indices)):
+        for atom in range(indices.shape[1]):
+            for axis in range(3):
+                local_positions[i, atom, axis] = positions[indices[i, atom], axis]
+                local_tangent[i, atom, axis] = tangent[indices[i, atom], axis]
+    local_hvp = specialized_hvps(local_positions, translations, local_tangent)
     out = np.zeros((len(indices), matrix.shape[2]))
     for i in range(len(indices)):
         for atom in range(indices.shape[1]):
