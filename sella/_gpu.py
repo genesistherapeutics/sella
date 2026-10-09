@@ -1,18 +1,23 @@
 """Centralized GPU helpers for Sella.
 
 Provides numpy-in / numpy-out wrappers for eigh and QR that route through
-torch+CUDA when a usable GPU is present, with a single shared `_has_torch`
-state and a size threshold that gates upload overhead.
+torch+CUDA when a usable GPU is present, with a shared `_has_torch` state
+and independently measured size thresholds that gate upload overhead.
 
-GPU usage is opt-out via SELLA_DISABLE_GPU=1 and the size threshold is
-tunable via SELLA_GPU_MIN_DIM (default 200). On a torch CUDA OOM the call
+GPU usage is opt-out via SELLA_DISABLE_GPU=1. Eigh and QR default to 500
+and 700 rows, respectively; SELLA_GPU_MIN_DIM overrides both, and their
+SELLA_GPU_EIGH_MIN_DIM / SELLA_GPU_QR_MIN_DIM overrides take precedence.
+On a torch CUDA OOM the call
 falls back to CPU and records the failure so subsequent calls skip the GPU
 attempt for that size; this keeps smaller GPUs from thrashing.
 """
 
 import os
+from contextlib import nullcontext
+from threading import BoundedSemaphore
 import numpy as np
 from scipy.linalg import eigh as _cpu_eigh
+from . import _numba
 from scipy.linalg import qr as _cpu_qr
 
 try:
@@ -35,14 +40,89 @@ try:
 except ValueError:
     _GPU_MATMUL_MIN_DIM = 1000
 
+# Separate crossovers measured against our nopython CPU LAPACK paths.
+# SELLA_GPU_MIN_DIM remains a shared explicit override for compatibility.
+def _threshold(name, default):
+    try:
+        return int(os.environ.get(name, os.environ.get("SELLA_GPU_MIN_DIM", str(default))))
+    except ValueError:
+        return default
+
+
+_GPU_EIGH_MIN_DIM = _threshold("SELLA_GPU_EIGH_MIN_DIM", 500)
+_GPU_QR_MIN_DIM = _threshold("SELLA_GPU_QR_MIN_DIM", 700)
+
 # After a CUDA OOM at dimension N, refuse subsequent GPU offload for shapes
 # >= N. Keeps a single failure from cascading and lets the CPU path take over
 # cleanly on small GPUs.
 _oom_floor = None
 
+# Process-wide budget shared by independent optimizer workers. Configure before
+# launching workers; generic Sella users retain double precision and no cap.
+_hessian_eigh_dtype = np.dtype('float64')
+_hessian_eigh_slots = None
+_hessian_eigh_min_dim = 200
+_UNSET = object()
 
-def _gpu_ok(n):
-    return _has_torch and n >= _GPU_MIN_DIM and (
+
+def configure_linalg(use_gpu=None, hessian_eigh_dtype=None,
+                     hessian_eigh_max_concurrent=_UNSET, hessian_eigh_min_dim=None):
+    """Update specified solver settings before starting optimizers."""
+    global _has_torch, _hessian_eigh_dtype, _hessian_eigh_slots, _hessian_eigh_min_dim
+    dtype = (_hessian_eigh_dtype if hessian_eigh_dtype is None
+             else np.dtype(hessian_eigh_dtype))
+    min_dim = (_hessian_eigh_min_dim if hessian_eigh_min_dim is None
+               else hessian_eigh_min_dim)
+    if dtype not in (np.dtype('float32'), np.dtype('float64')):
+        raise ValueError('Hessian eigensolves require float32 or float64')
+    if (hessian_eigh_max_concurrent is not _UNSET
+            and hessian_eigh_max_concurrent is not None
+            and hessian_eigh_max_concurrent < 1):
+        raise ValueError('Hessian eigensolve concurrency must be positive')
+    if min_dim < 0:
+        raise ValueError('Hessian eigensolve minimum dimension must be nonnegative')
+    gpu_enabled = _has_torch if use_gpu is None else bool(use_gpu)
+    if dtype == np.dtype('float32') and gpu_enabled:
+        raise ValueError('Float32 Hessian eigensolves require use_gpu=False')
+    slots = _hessian_eigh_slots
+    if hessian_eigh_max_concurrent is not _UNSET:
+        slots = (BoundedSemaphore(hessian_eigh_max_concurrent)
+                 if hessian_eigh_max_concurrent is not None else None)
+    if use_gpu is not None:
+        _has_torch = bool(use_gpu and torch is not None and torch.cuda.is_available())
+    _hessian_eigh_dtype = dtype
+    _hessian_eigh_min_dim = min_dim
+    _hessian_eigh_slots = slots
+
+
+def hessian_eigh_budget(dimension):
+    """Hold one slot through a Hessian solve, synchronization and any fallback."""
+    if _hessian_eigh_slots is None or dimension < _hessian_eigh_min_dim:
+        return nullcontext()
+    return _hessian_eigh_slots
+
+
+def _hessian_eigh_unlimited(matrix, A_gpu=None):
+    """Solve under a budget already held by the caller; do not acquire twice."""
+    if _hessian_eigh_dtype == np.dtype('float32') and _numba.ENABLED and matrix.size:
+        try:
+            values, vectors = _numba.eigh(np.ascontiguousarray(matrix, dtype=np.float32))
+            if not np.isfinite(values).all() or not np.isfinite(vectors).all():
+                raise np.linalg.LinAlgError('Nonfinite float32 eigenpairs')
+            return values.astype(np.float64), vectors.astype(np.float64)
+        except np.linalg.LinAlgError:
+            pass
+    return gpu_eigh(matrix, A_gpu=A_gpu)
+
+
+def hessian_eigh(matrix, A_gpu=None):
+    """Solve a Hessian with float64 outputs, retrying failed FP32 solves in FP64."""
+    with hessian_eigh_budget(matrix.shape[0]):
+        return _hessian_eigh_unlimited(matrix, A_gpu=A_gpu)
+
+
+def _gpu_ok(n, min_dim=None):
+    return _has_torch and n >= (_GPU_MIN_DIM if min_dim is None else min_dim) and (
         _oom_floor is None or n < _oom_floor
     )
 
@@ -91,7 +171,7 @@ def gpu_eigh(A, A_gpu=None):
         # a fully-constrained (empty) subspace don't crash.
         return (np.empty(0, dtype=np.float64),
                 np.empty((0, 0), dtype=np.float64))
-    if A_gpu is not None or _gpu_ok(n):
+    if A_gpu is not None or _gpu_ok(n, _GPU_EIGH_MIN_DIM):
         try:
             At = A_gpu if A_gpu is not None else to_gpu(A)
             if At is not None:
@@ -99,7 +179,7 @@ def gpu_eigh(A, A_gpu=None):
                 return evals_t.cpu().numpy(), evecs_t.cpu().numpy()
         except (RuntimeError, MemoryError):
             _record_oom(n)
-    return _cpu_eigh(A)
+    return _numba.eigh(np.ascontiguousarray(A)) if _numba.ENABLED else _cpu_eigh(A)
 
 
 def gpu_eigh_t(A_gpu):
@@ -118,7 +198,7 @@ def gpu_eigh_t(A_gpu):
 def gpu_qr(A):
     """Economy QR. GPU when beneficial, CPU otherwise."""
     n = A.shape[0]
-    if _gpu_ok(n):
+    if _gpu_ok(n, _GPU_QR_MIN_DIM):
         try:
             At = to_gpu(A)
             if At is not None:
@@ -128,6 +208,8 @@ def gpu_qr(A):
             _record_oom(n)
     if n == 0:
         return np.linalg.qr(A, mode='reduced')
+    if _numba.ENABLED and A.shape[1] > 0:
+        return _numba.qr(np.ascontiguousarray(A))
     return _cpu_qr(A, mode='economic', pivoting=False, check_finite=False)
 
 
@@ -141,7 +223,7 @@ def gpu_qr_with_pinv(A, rank_rtol=1e-6):
     rank-deficient fallback without refactorizing on CPU.
     """
     n = A.shape[0]
-    if not _gpu_ok(n):
+    if not _gpu_ok(n, _GPU_QR_MIN_DIM):
         return None
 
     try:

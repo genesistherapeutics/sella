@@ -22,6 +22,7 @@ import jax
 from .optimize import IRC, Sella
 from .internal import Internals, Constraints
 from ._threads import configure_compute, set_cpu_threads
+from ._numba import warmup
 
 jax.config.update("jax_enable_x64", True)
 
@@ -34,4 +35,4 @@ if _cache_dir is not None:
     except Exception:
         pass  # JAX version may not support these options
 
-__all__ = ['IRC', 'Sella', 'configure_compute', 'set_cpu_threads']
+__all__ = ['IRC', 'Sella', 'configure_compute', 'set_cpu_threads', 'warmup']
